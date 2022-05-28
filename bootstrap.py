@@ -1,16 +1,14 @@
 from clrprint import clrprint
 import contextlib
 from dataclasses import dataclass
+from mne.time_frequency import psd_array_multitaper
 import numpy as np
 from pathlib import Path
-import typing as tp
 from scipy.integrate import simps
-from scipy.signal import welch
+from tqdm import tqdm
+import typing as tp
 import scipy.stats as sps
 import sys
-from tqdm import tqdm
-from sortedcontainers.sortedset import SortedSet
-from operator import itemgetter
 
 
 ################################################################################
@@ -53,18 +51,18 @@ ROOT = Path(__file__).parent
 ################################################################################
 # Sleep detection #
 ################################################################################
-USE_EEG_SLEEP_DETECTION = False
+USE_EEG_SLEEP_DETECTION = True
 EEG_FREQ: int = 200  # Number of EEG measures per second.
-
+DELTA_INTERVAL: float = 10
+EEG_SLEEP_THRESHOLD = .76
 ################################################################################
+
 
 ################################################################################
 # Implementation
 ################################################################################
 # Logging
 ################################################################################
-
-
 def fmt_path(path: Path) -> str:
     return f'"{path.relative_to(ROOT)}"'
 
@@ -88,11 +86,11 @@ def info(msg: str) -> None:
 def warn(msg: str) -> None:
     clrprint('[WARN]', clr='yellow', end='\t')
     print(msg)
+
+
 ################################################################################
 # Data loading
 ################################################################################
-
-
 @dataclass
 class EEG:
     start_time: float
@@ -220,88 +218,61 @@ def load_everything() -> Data:
 
 
 ################################################################################
+# Sleep extraction
+################################################################################
+def band_power(data, sf, band):
+    band = np.asarray(band)
+    low, high = band
+
+    psd, freqs = psd_array_multitaper(data, sf, adaptive=True,
+                                      normalization='full', verbose=0)
+
+    # Frequency resolution
+    freq_res = freqs[1] - freqs[0]
+
+    # Find index of band in frequency vector
+    idx_band = np.logical_and(freqs >= low, freqs <= high)
+
+    # Integral approximation of the spectrum using parabola (Simpson's rule)
+    bp = simps(psd[idx_band], dx=freq_res)
+
+    return bp
+
+
+def extract_sleep(neuron: np.ndarray, eeg: EEG) -> np.ndarray:
+    if not USE_EEG_SLEEP_DETECTION:
+        return neuron
+
+    specter = np.array([
+        band_power(eeg.eeg[i: i + EEG_FREQ * DELTA_INTERVAL], EEG_FREQ, [1, 4])
+        for i in range(0, len(eeg.eeg), int(EEG_FREQ * DELTA_INTERVAL))
+    ])
+    good_delta_intervals = np.where(
+        specter.max(initial=0) * EEG_SLEEP_THRESHOLD <= specter)[0]
+    result = np.array([], dtype='float')
+    for good_interval in good_delta_intervals:
+        start_time = good_interval * DELTA_INTERVAL + eeg.start_time
+        start_index, end_index = \
+            neuron.searchsorted([start_time, start_time + DELTA_INTERVAL])
+        result = np.append(result, neuron[start_index:end_index])
+    return result
+
+
+################################################################################
 # Bootstrap
 ################################################################################
-class SampleValidator:
-    def __init__(self):
-        self.ranges = SortedSet(key=itemgetter(0))
-
-    def prohibit_range(self, begin: float, end: float):
-        while True:
-            left_pos = self.ranges.bisect_right((end, end))
-            if left_pos == 0:
-                self.ranges.add((begin, end))
-                break
-            left_pos -= 1
-            left_begin, left_end = self.ranges[left_pos]
-            # left_begin <= end
-            if left_end < begin:  # Disjoint ranges.
-                self.ranges.add((begin, end))
-                break
-            self.ranges.pop(left_pos)
-            begin = min(begin, left_begin)
-            end = max(end, left_end)
-
-    def check_point(self, point: float) -> bool:
-        left_pos = self.ranges.bisect_right((point, point))
-        if left_pos == 0:
-            return True
-        left_pos -= 1
-        return self.ranges[left_pos][1] < point
-
-
-def generate_sample(apnoe_starts: np.ndarray, apnoe_duration: float,
-                    max_time: float) -> np.ndarray:
-    validator = SampleValidator()
-    validator.prohibit_range(float('-inf'), 0.)
-    validator.prohibit_range(max_time, float('inf'))
-    for apnoe in apnoe_starts:
-        validator.prohibit_range(apnoe - apnoe_duration, apnoe + apnoe_duration)
-
-    generator = sps.uniform(0, max_time - apnoe_duration)
-
-    size = 0
-    sample = np.zeros(BOOTSTRAP_SIZE, dtype='float')
-
-    i = 0
-    values = np.array([], dtype='float')
-
-    def get_point() -> float:
-        nonlocal i, size, values
-        if i == len(values):
-            i = 0
-            values = generator.rvs(size=BOOTSTRAP_SIZE - size)
-        i += 1
-        return values[i - 1]
-
+def generate_sample(apnoe_duration: float, max_time: float) -> np.ndarray:
     info('Bootstrapping sample...')
     info(f'Apnoe duration: {apnoe_duration}')
     info(f'Max time: {max_time}')
-    for _ in range(BOOTSTRAP_SIZE):
-        good = False
-        for retry in range(50):
-            p = get_point()
-            if validator.check_point(p) or True:
-                sample[size] = p
-                size += 1
-                validator.prohibit_range(p - apnoe_duration, p + apnoe_duration)
-                good = True
-                break
-        if not good:
-            continue
-    if size == BOOTSTRAP_SIZE:
-        ok('Sample ready')
-    elif size == 0:
-        fail('Bootstrap failed')
-    else:
-        warn(f'Bootstrapped sample is small: {size} instead of '
-             f'{BOOTSTRAP_SIZE}')
-    return sample[:size]
+    sample = sps.uniform(0, max_time - apnoe_duration).rvs(size=BOOTSTRAP_SIZE)
+    ok('Sample ready')
+    return sample
+
+
 ################################################################################
 # Neuron processing
 ################################################################################
-
-
 @dataclass
 class CurveStats:
     min_value: float
@@ -335,7 +306,7 @@ def find_min_max(data: np.ndarray) -> CurveStats:
     return CurveStats(data[min_pos], data[max_pos], min_pos, max_pos)
 
 
-result = open('result.txt', 'w')
+result_file = open('result.txt', 'w')
 
 
 def process_neuron(neuron: np.ndarray, apnoes: np.ndarray, eeg: EEG):
@@ -348,20 +319,21 @@ def process_neuron(neuron: np.ndarray, apnoes: np.ndarray, eeg: EEG):
         info(f'Time of minimum: {apnoe_stats.min_time - APNOE_LEFT_DURATION}')
         info(f'Time of maximum: {apnoe_stats.max_time - APNOE_LEFT_DURATION}')
         apnoe_duration = abs(apnoe_stats.min_time - apnoe_stats.max_time)
-        bootstrapped_sample = generate_sample(apnoes +
-                                              min(apnoe_stats.min_time,
-                                                  apnoe_stats.max_time),
-                                              apnoe_duration,
+        sleep = extract_sleep(neuron, eeg)
+        bootstrapped_sample = generate_sample(apnoe_duration,
                                               float(neuron.max(initial=.0)) + 1)
-        bootstrapped_stats = np.array([
-            find_min_max(calc_freq(neuron, begin, begin + apnoe_duration)).dif
-            for begin in bootstrapped_sample
-        ])
+        bootstrapped_stats = []
+        info('Bootstrap...')
+        for begin in tqdm(bootstrapped_sample, file=sys.stdout):
+            bootstrapped_stats.append(
+                find_min_max(calc_freq(sleep, begin,
+                                       begin + apnoe_duration)).dif)
+        bootstrapped_stats = np.array(bootstrapped_stats)
         bootstrapped_stats.sort()
         num_less = bootstrapped_stats.searchsorted(apnoe_stats.dif)
         p_value = 1. - num_less / BOOTSTRAP_SIZE
         info(f'p-value = {p_value:.2f}')
-        print(f'{p_value:.2f}', file=result)
+        print(f'{p_value:.2f}', file=result_file)
         info(f'min: {bootstrapped_stats[0]:.2f}')
         info(f'max: {bootstrapped_stats[-1]:.2f}')
         info(f'apnoe: {apnoe_stats.dif}')
@@ -377,6 +349,7 @@ def main():
         info(f'Processing {neuron_name}...')
         process_neuron(neuron, data.apnoes, data.eeg)
         ok(f'Neuron processing finished: {neuron_name}')
+    result_file.close()
 
 
 if __name__ == '__main__':
