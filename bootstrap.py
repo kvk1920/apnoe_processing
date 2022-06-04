@@ -10,6 +10,8 @@ import typing as tp
 import scipy.stats as sps
 import sys
 
+import matplotlib.pyplot as plt
+
 
 ################################################################################
 # Configuration #
@@ -22,18 +24,18 @@ import sys
 # Bootstrap #
 ################################################################################
 # Duration of left apnoe part.
-APNOE_LEFT_DURATION: float = 5.0
-APNOE_RIGHT_DURATION: float = 5.0
+APNOE_LEFT_DURATION: float = 4.0
+APNOE_RIGHT_DURATION: float = 2.0
 # Shift of sliding window which is used in frequency curve calculating (in
 # seconds).
-SLIDING_WINDOW_SHIFT: float = 0.001
+SLIDING_WINDOW_SHIFT: float = 0.01
 # Duration of sliding window for frequency curve calculating (in seconds).
-SLIDING_WINDOW_DURATION: float = 1.0
+SLIDING_WINDOW_DURATION: float = 0.100
 # Minimal allowed time between different elements of bootstrap sample (in
 # seconds).
 BOOTSTRAP_MIN_CLOSENESS: float = 1.0
 # Bootstrap sample size.
-BOOTSTRAP_SIZE: int = 10000
+BOOTSTRAP_SIZE: int = 1000
 # Neediness of plot of found min/max frequency.
 MINMAX_PLOT_IS_NEEDED = False
 # Total apnoe duration.
@@ -51,10 +53,10 @@ ROOT = Path(__file__).parent
 ################################################################################
 # Sleep detection #
 ################################################################################
-USE_EEG_SLEEP_DETECTION = True
+USE_EEG_SLEEP_DETECTION = False
 EEG_FREQ: int = 200  # Number of EEG measures per second.
-DELTA_INTERVAL: float = 10
-EEG_SLEEP_THRESHOLD = .76
+DELTA_INTERVAL: int = 10  # (seconds)
+EEG_SLEEP_THRESHOLD = .6
 ################################################################################
 
 
@@ -68,23 +70,23 @@ def fmt_path(path: Path) -> str:
 
 
 def ok(msg: str) -> None:
-    clrprint('[ OK ]', clr='green', end='\t')
+    clrprint('[+]', clr='green', end='\t')
     print(msg)
 
 
 def fail(msg: str) -> None:
-    clrprint('[FAIL]', clr='red', end='\t')
+    clrprint('[-]', clr='red', end='\t')
     print(msg)
     exit(1)
 
 
 def info(msg: str) -> None:
-    clrprint('[INFO]', clr='blue', end='\t')
+    clrprint('[.]', clr='blue', end='\t')
     print(msg)
 
 
 def warn(msg: str) -> None:
-    clrprint('[WARN]', clr='yellow', end='\t')
+    clrprint('[!]', clr='yellow', end='\t')
     print(msg)
 
 
@@ -175,7 +177,7 @@ def load_everything() -> Data:
         content = None
         with contextlib.suppress(Exception):
             content = np.loadtxt(str(path), skiprows=skip_rows, dtype='float')
-        if len(content.shape) == 0:
+        if content is not None and len(content.shape) == 0:
             content.shape = (1,)
         if content is not None and len(content) > 0 and len(content.shape) == 1:
             ok(f'{fmt_path(path)} loaded')
@@ -240,21 +242,36 @@ def band_power(data, sf, band):
 
 
 def extract_sleep(neuron: np.ndarray, eeg: EEG) -> np.ndarray:
+    prefix_length = neuron.searchsorted([eeg.start_time])[0]
+    neuron = neuron[prefix_length:]
+    neuron -= eeg.start_time
+
     if not USE_EEG_SLEEP_DETECTION:
         return neuron
 
+    info('Extracting sleep...');
+
     specter = np.array([
-        band_power(eeg.eeg[i: i + EEG_FREQ * DELTA_INTERVAL], EEG_FREQ, [1, 4])
+        band_power(eeg.eeg[i: i + int(EEG_FREQ * DELTA_INTERVAL)], EEG_FREQ,
+                   [1, 4])
         for i in range(0, len(eeg.eeg), int(EEG_FREQ * DELTA_INTERVAL))
     ])
     good_delta_intervals = np.where(
         specter.max(initial=0) * EEG_SLEEP_THRESHOLD <= specter)[0]
     result = np.array([], dtype='float')
+    sleep_duration = 0.
     for good_interval in good_delta_intervals:
-        start_time = good_interval * DELTA_INTERVAL + eeg.start_time
+        start_time = good_interval * DELTA_INTERVAL
         start_index, end_index = \
             neuron.searchsorted([start_time, start_time + DELTA_INTERVAL])
-        result = np.append(result, neuron[start_index:end_index])
+        result = np.append(
+            result, sleep_duration + neuron[start_index:end_index] - start_time)
+        sleep_duration += DELTA_INTERVAL
+
+    assert np.all(result[:-1] <= result[1:])
+
+    ok(f'Extracted {sleep_duration} seconds of sleep')
+
     return result
 
 
@@ -294,10 +311,10 @@ class CurveStats:
 
 
 def calc_freq(neuron: np.ndarray, start: float, end: float) -> np.ndarray:
-    starts = np.arange(start, end - 1, SLIDING_WINDOW_SHIFT)
+    starts = np.arange(start, end - SLIDING_WINDOW_DURATION,
+                       SLIDING_WINDOW_SHIFT)
     ends = starts + SLIDING_WINDOW_DURATION
-    return (np.searchsorted(neuron, ends) - np.searchsorted(neuron, starts)) / \
-           (ends - starts)
+    return np.searchsorted(neuron, ends) - np.searchsorted(neuron, starts)
 
 
 def find_min_max(data: np.ndarray) -> CurveStats:
@@ -306,22 +323,35 @@ def find_min_max(data: np.ndarray) -> CurveStats:
     return CurveStats(data[min_pos], data[max_pos], min_pos, max_pos)
 
 
-result_file = open('result.txt', 'w')
+def process_neuron(neuron: np.ndarray, apnoes: np.ndarray, eeg: EEG,
+                   result_file):
 
+    plt.hist(neuron, bins=6000)
+    plt.show()
 
-def process_neuron(neuron: np.ndarray, apnoes: np.ndarray, eeg: EEG):
     activity_in_apnoes = [calc_freq(neuron, apnoe - APNOE_LEFT_DURATION,
                                     apnoe + APNOE_RIGHT_DURATION)
                           for apnoe in apnoes]
     for i, activity in enumerate(activity_in_apnoes):
         info(f'Processing apnoe {i}...')
+
+        plt.plot(np.linspace(-APNOE_LEFT_DURATION, APNOE_RIGHT_DURATION,
+                             len(activity)),
+                 activity)
+        plt.show()
+
         apnoe_stats = find_min_max(activity)
         info(f'Time of minimum: {apnoe_stats.min_time - APNOE_LEFT_DURATION}')
         info(f'Time of maximum: {apnoe_stats.max_time - APNOE_LEFT_DURATION}')
         apnoe_duration = abs(apnoe_stats.min_time - apnoe_stats.max_time)
         sleep = extract_sleep(neuron, eeg)
         bootstrapped_sample = generate_sample(apnoe_duration,
-                                              float(neuron.max(initial=.0)) + 1)
+                                              float(sleep.max(initial=.0)))
+
+        # for i, x_time in enumerate(bootstrapped_sample):
+        #     plt.axvline(x_time, alpha=.6, c=['red', 'orange', 'blue', 'green', 'magenta'][i % 5])
+        # plt.show()
+
         bootstrapped_stats = []
         info('Bootstrap...')
         for begin in tqdm(bootstrapped_sample, file=sys.stdout):
@@ -330,10 +360,14 @@ def process_neuron(neuron: np.ndarray, apnoes: np.ndarray, eeg: EEG):
                                        begin + apnoe_duration)).dif)
         bootstrapped_stats = np.array(bootstrapped_stats)
         bootstrapped_stats.sort()
+
+        plt.plot(range(len(bootstrapped_stats)), bootstrapped_stats)
+        plt.show()
+
         num_less = bootstrapped_stats.searchsorted(apnoe_stats.dif)
         p_value = 1. - num_less / BOOTSTRAP_SIZE
-        info(f'p-value = {p_value:.2f}')
-        print(f'{p_value:.2f}', file=result_file)
+        info(f'p-value = {p_value:.5f}')
+        print(f'{p_value:.5f}', file=result_file)
         info(f'min: {bootstrapped_stats[0]:.2f}')
         info(f'max: {bootstrapped_stats[-1]:.2f}')
         info(f'apnoe: {apnoe_stats.dif}')
@@ -345,14 +379,14 @@ def process_neuron(neuron: np.ndarray, apnoes: np.ndarray, eeg: EEG):
 
 def main():
     data = load_everything()
-    for neuron_name, neuron in data.neurons.items():
-        info(f'Processing {neuron_name}...')
-        process_neuron(neuron, data.apnoes, data.eeg)
-        ok(f'Neuron processing finished: {neuron_name}')
-    result_file.close()
+    with open(f'result.txt', 'w') as f:
+        for neuron_name, neuron in data.neurons.items():
+            info(f'Processing {neuron_name}...')
+            print(neuron_name, end='\t', file=f)
+            process_neuron(neuron, data.apnoes, data.eeg, f)
+            ok(f'Neuron processing finished: {neuron_name}')
 
 
 if __name__ == '__main__':
-    # colorama.init()
     np.random.seed(42)
     main()
