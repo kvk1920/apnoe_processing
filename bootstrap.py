@@ -1,3 +1,5 @@
+import math
+
 from clrprint import clrprint
 import contextlib
 from dataclasses import dataclass
@@ -49,14 +51,21 @@ CURVE_SIZE = int(round((APNOE_DURATION - SLIDING_WINDOW_DURATION) /
 APNOE_FILE_PATTERN = '* Apnoe.txt'
 NEURON_FILE_PATTERNS = ['* neuron*.txt', '* All_neuron*.txt']
 EEG_FILE_PATTERN = '* EEG_sleep.txt'
+ESA_FILE_PATTERN = '* ESA.txt'
 ROOT = Path(__file__).parent
+IMAGES = ROOT / 'images'
 ################################################################################
 # Sleep detection #
 ################################################################################
 USE_EEG_SLEEP_DETECTION = False
+# TODO: Parse file header to extract EEG_FREQ instead of using this constant.
 EEG_FREQ: int = 200  # Number of EEG measures per second.
 DELTA_INTERVAL: int = 10  # (seconds)
 EEG_SLEEP_THRESHOLD = .6
+################################################################################
+# ESA processing #
+################################################################################
+ESA_FREQ: int = 1000
 ################################################################################
 
 
@@ -94,16 +103,27 @@ def warn(msg: str) -> None:
 # Data loading
 ################################################################################
 @dataclass
-class EEG:
+class Curve:
     start_time: float
-    eeg: np.ndarray
+    values: np.ndarray
+
+    def get_interval(self, start: float, end: float, sf: float) -> np.ndarray:
+        start_i = math.floor((start - self.start_time) * sf)
+        end_i = math.ceil((end - self.start_time) * sf)
+        start_i = max(0, min(start_i, len(self.values) - 1))
+        end_i = max(1, min(end_i, len(self.values)))
+        return self.values[start_i:end_i]
+
+    def end_time(self, sf: float) -> float:
+        return self.start_time + len(self.values) / sf
 
 
 @dataclass
 class Data:
     apnoes: np.ndarray
     neurons: tp.Dict[str, np.ndarray]
-    eeg: tp.Optional[EEG] = None
+    eeg: tp.Optional[Curve] = None
+    esa: tp.Optional[Curve] = None
 
 
 def validate_file_prefixes(paths: tp.List[Path]) -> None:
@@ -114,7 +134,8 @@ def validate_file_prefixes(paths: tp.List[Path]) -> None:
         fail(f'Files have different prefixes: {prefixes}')
 
 
-def find_files() -> tp.Tuple[Path, tp.List[Path], tp.Optional[Path]]:
+def find_files() -> tp.Tuple[Path, tp.List[Path], tp.Optional[Path],
+                             tp.Optional[Path]]:
     info('Locating files...')
     info(f'Root: {ROOT}')
 
@@ -128,6 +149,7 @@ def find_files() -> tp.Tuple[Path, tp.List[Path], tp.Optional[Path]]:
 
     info(f'EEG file pattern: "{EEG_FILE_PATTERN}"')
     eeg_files = list(ROOT.glob(EEG_FILE_PATTERN))
+    esa_files = list(ROOT.glob(ESA_FILE_PATTERN))
 
     validate_file_prefixes(apnoe_files + neuron_files + eeg_files)
 
@@ -163,12 +185,22 @@ def find_files() -> tp.Tuple[Path, tp.List[Path], tp.Optional[Path]]:
     else:
         file_not_found('EEG', warn_only=not USE_EEG_SLEEP_DETECTION)
         eeg_file = None
+
+    if len(esa_files) > 1:
+        multiple_files_found('ESA', esa_files)
+    if esa_files:
+        esa_file = esa_files[0]
+        file_found('ESA', esa_file)
+    else:
+        file_not_found('ESA', warn_only=True)
+        esa_file = None
+
     ok('Files located')
-    return apnoe_file, neuron_files, eeg_file
+    return apnoe_file, neuron_files, eeg_file, esa_file
 
 
 def load_everything() -> Data:
-    apnoe_file, neuron_files, eeg_file = find_files()
+    apnoe_file, neuron_files, eeg_file, esa_file = find_files()
 
     info('Loading files...')
 
@@ -212,11 +244,18 @@ def load_everything() -> Data:
             with open(eeg_file) as f:
                 for _ in range(7):
                     line = next(f)
-            eeg = EEG(start_time=float(line.split()[1]), eeg=eeg_content)
+            eeg = Curve(start_time=float(line.split()[1]), values=eeg_content)
             info(f'EEG start time: {eeg.start_time}')
 
+    esa = None
+    if esa_file:
+        esa_content = load_file(esa_file, required=False,
+                                skip_rows=7)
+        if esa_content is not None:
+            esa = Curve(start_time=.0, values=esa_content)
+
     ok('Files loaded')
-    return Data(apnoes=apnoe_data, neurons=neurons, eeg=eeg)
+    return Data(apnoes=apnoe_data, neurons=neurons, eeg=eeg, esa=esa)
 
 
 ################################################################################
@@ -241,7 +280,7 @@ def band_power(data, sf, band):
     return bp
 
 
-def extract_sleep(neuron: np.ndarray, eeg: EEG) -> np.ndarray:
+def extract_sleep(neuron: np.ndarray, eeg: Curve) -> np.ndarray:
     prefix_length = neuron.searchsorted([eeg.start_time])[0]
     neuron = neuron[prefix_length:]
     neuron -= eeg.start_time
@@ -252,9 +291,9 @@ def extract_sleep(neuron: np.ndarray, eeg: EEG) -> np.ndarray:
     info('Extracting sleep...');
 
     specter = np.array([
-        band_power(eeg.eeg[i: i + int(EEG_FREQ * DELTA_INTERVAL)], EEG_FREQ,
+        band_power(eeg.values[i: i + int(EEG_FREQ * DELTA_INTERVAL)], EEG_FREQ,
                    [1, 4])
-        for i in range(0, len(eeg.eeg), int(EEG_FREQ * DELTA_INTERVAL))
+        for i in range(0, len(eeg.values), int(EEG_FREQ * DELTA_INTERVAL))
     ])
     good_delta_intervals = np.where(
         specter.max(initial=0) * EEG_SLEEP_THRESHOLD <= specter)[0]
@@ -278,11 +317,13 @@ def extract_sleep(neuron: np.ndarray, eeg: EEG) -> np.ndarray:
 ################################################################################
 # Bootstrap
 ################################################################################
-def generate_sample(apnoe_duration: float, max_time: float) -> np.ndarray:
+def generate_sample(apnoe_duration: float, max_time: float,
+                    min_time: float = 0.) -> np.ndarray:
     info('Bootstrapping sample...')
     info(f'Apnoe duration: {apnoe_duration}')
     info(f'Max time: {max_time}')
-    sample = sps.uniform(0, max_time - apnoe_duration).rvs(size=BOOTSTRAP_SIZE)
+    sample = sps.uniform(min_time, max_time - apnoe_duration).rvs(
+        size=BOOTSTRAP_SIZE)
     ok('Sample ready')
     return sample
 
@@ -323,34 +364,30 @@ def find_min_max(data: np.ndarray) -> CurveStats:
     return CurveStats(data[min_pos], data[max_pos], min_pos, max_pos)
 
 
-def process_neuron(neuron: np.ndarray, apnoes: np.ndarray, eeg: EEG,
-                   result_file):
-
-    plt.hist(neuron, bins=6000)
-    plt.show()
-
+def process_neuron(neuron: np.ndarray, apnoes: np.ndarray, eeg: Curve,
+                   result_file, neuron_name: str):
     activity_in_apnoes = [calc_freq(neuron, apnoe - APNOE_LEFT_DURATION,
                                     apnoe + APNOE_RIGHT_DURATION)
                           for apnoe in apnoes]
+    sleep = extract_sleep(neuron, eeg)
+
     for i, activity in enumerate(activity_in_apnoes):
         info(f'Processing apnoe {i}...')
 
         plt.plot(np.linspace(-APNOE_LEFT_DURATION, APNOE_RIGHT_DURATION,
-                             len(activity)),
-                 activity)
-        plt.show()
+                             len(activity)), activity)
+        plt.xlabel('time')
+        plt.ylabel('Neuron activity')
+        plt.title(f'Apnoe at {apnoes[i]}')
+        plt.savefig(str((IMAGES / f'{neuron_name}_apnoe_{i}.png')))
+        plt.clf()
 
         apnoe_stats = find_min_max(activity)
         info(f'Time of minimum: {apnoe_stats.min_time - APNOE_LEFT_DURATION}')
         info(f'Time of maximum: {apnoe_stats.max_time - APNOE_LEFT_DURATION}')
         apnoe_duration = abs(apnoe_stats.min_time - apnoe_stats.max_time)
-        sleep = extract_sleep(neuron, eeg)
         bootstrapped_sample = generate_sample(apnoe_duration,
                                               float(sleep.max(initial=.0)))
-
-        # for i, x_time in enumerate(bootstrapped_sample):
-        #     plt.axvline(x_time, alpha=.6, c=['red', 'orange', 'blue', 'green', 'magenta'][i % 5])
-        # plt.show()
 
         bootstrapped_stats = []
         info('Bootstrap...')
@@ -361,8 +398,97 @@ def process_neuron(neuron: np.ndarray, apnoes: np.ndarray, eeg: EEG,
         bootstrapped_stats = np.array(bootstrapped_stats)
         bootstrapped_stats.sort()
 
-        plt.plot(range(len(bootstrapped_stats)), bootstrapped_stats)
-        plt.show()
+        num_less = bootstrapped_stats.searchsorted(apnoe_stats.dif)
+        p_value = 1. - num_less / BOOTSTRAP_SIZE
+        info(f'p-value = {p_value:.5f}')
+        print(f'{p_value:.5f}', file=result_file)
+        info(f'min: {bootstrapped_stats[0]:.2f}')
+        info(f'max: {bootstrapped_stats[-1]:.2f}')
+        info(f'apnoe: {apnoe_stats.dif}')
+
+        if num_less:
+            plt.scatter(range(num_less), bootstrapped_stats[:num_less], c='k')
+        if num_less < len(bootstrapped_stats):
+            plt.scatter(np.arange(num_less, len(bootstrapped_stats)) + 1,
+                        bootstrapped_stats[num_less:], c='k')
+        plt.axvline(num_less, c='r', label=f'p-value = {p_value}',
+                    linestyle='--')
+        plt.scatter([num_less], apnoe_stats.dif, c='r', edgecolors='k')
+        plt.title(f'Apnoe at {apnoes[i]}')
+        plt.legend()
+        plt.xlabel('Number')
+        plt.ylabel('Statistic value')
+        plt.savefig(str((IMAGES / f'{neuron_name}_apnoe_{i}_bootstrap.png')))
+        plt.clf()
+
+        ok('Apnoe processing finished')
+
+
+################################################################################
+# ESA processing
+################################################################################
+def extract_sleep_esa(esa: Curve, eeg: tp.Optional[Curve]) -> Curve:
+    if not USE_EEG_SLEEP_DETECTION:
+        return esa
+
+    assert eeg is not None
+
+    info('Extracting sleep...')
+    result = Curve(start_time=eeg.start_time, values=np.array([],
+                                                              dtype='float'))
+
+    specter = np.array([
+        band_power(eeg.values[i: i + int(EEG_FREQ * DELTA_INTERVAL)], EEG_FREQ,
+                   [1, 4])
+        for i in range(0, len(eeg.values), int(EEG_FREQ * DELTA_INTERVAL))
+    ])
+    good_delta_intervals = np.where(
+        specter.max(initial=0) * EEG_SLEEP_THRESHOLD <= specter)[0]
+
+    for good_interval in good_delta_intervals:
+        start_time = eeg.start_time + good_interval * DELTA_INTERVAL
+        result.values = np.append(result.values, esa.get_interval(
+            start_time, start_time + DELTA_INTERVAL, ESA_FREQ))
+
+    ok(f'Sleep extracted from ESA')
+    return result
+
+
+def process_esa(esa: Curve, apnoes: np.ndarray, eeg: Curve, result_file):
+    esa_in_apnoes = [esa.get_interval(apnoe - APNOE_LEFT_DURATION,
+                                      apnoe + APNOE_RIGHT_DURATION, ESA_FREQ)
+                     for apnoe in apnoes]
+
+    sleep = extract_sleep_esa(esa, eeg)
+
+    for i, apnoe_esa in enumerate(esa_in_apnoes):
+        info(f'Processing apnoe {i}...')
+
+        plt.plot(np.linspace(-APNOE_LEFT_DURATION, APNOE_RIGHT_DURATION,
+                             len(apnoe_esa)), apnoe_esa)
+        plt.xlabel('time')
+        plt.ylabel('ESA')
+        plt.title(f'Apnoe at {apnoes[i]}')
+        plt.savefig(str((IMAGES / f'esa_apnoe_{i}.png')))
+        plt.clf()
+
+        apnoe_stats = find_min_max(apnoe_esa)
+        info(f'Time of minimum: {apnoe_stats.min_time - APNOE_LEFT_DURATION}')
+        info(f'Time of maximum: {apnoe_stats.max_time - APNOE_LEFT_DURATION}')
+        apnoe_duration = abs(apnoe_stats.min_time - apnoe_stats.max_time)
+        bootstrapped_sample = generate_sample(
+            apnoe_duration, float(sleep.end_time(ESA_FREQ)),
+            min_time=sleep.start_time
+        )
+
+        bootstrapped_stats = []
+        info('Bootstrap...')
+        for begin in tqdm(bootstrapped_sample, file=sys.stdout):
+            bootstrapped_stats.append(find_min_max(
+                sleep.get_interval(begin, begin + apnoe_duration,
+                                   ESA_FREQ)).dif)
+        bootstrapped_stats = np.array(bootstrapped_stats)
+        bootstrapped_stats.sort()
 
         num_less = bootstrapped_stats.searchsorted(apnoe_stats.dif)
         p_value = 1. - num_less / BOOTSTRAP_SIZE
@@ -371,20 +497,40 @@ def process_neuron(neuron: np.ndarray, apnoes: np.ndarray, eeg: EEG,
         info(f'min: {bootstrapped_stats[0]:.2f}')
         info(f'max: {bootstrapped_stats[-1]:.2f}')
         info(f'apnoe: {apnoe_stats.dif}')
+
+        if num_less:
+            plt.scatter(range(num_less), bootstrapped_stats[:num_less], c='k')
+        if num_less < len(bootstrapped_stats):
+            plt.scatter(np.arange(num_less, len(bootstrapped_stats)) + 1,
+                        bootstrapped_stats[num_less:], c='k')
+        plt.axvline(num_less, c='r', label=f'p-value = {p_value}',
+                    linestyle='--')
+        plt.scatter([num_less], apnoe_stats.dif, c='r', edgecolors='k')
+        plt.title(f'Apnoe at {apnoes[i]}')
+        plt.legend()
+        plt.xlabel('Number')
+        plt.ylabel('Statistic value')
+        plt.savefig(str((IMAGES / f'esa_apnoe_{i}_bootstrap.png')))
+        plt.clf()
+
         ok('Apnoe processing finished')
 
 
 ################################################################################
-
-
 def main():
+    IMAGES.mkdir(exist_ok=True)
     data = load_everything()
     with open(f'result.txt', 'w') as f:
         for neuron_name, neuron in data.neurons.items():
             info(f'Processing {neuron_name}...')
             print(neuron_name, end='\t', file=f)
-            process_neuron(neuron, data.apnoes, data.eeg, f)
+            process_neuron(neuron, data.apnoes, data.eeg, f, neuron_name)
             ok(f'Neuron processing finished: {neuron_name}')
+        if data.esa is not None:
+            info(f'Processing ESA...')
+            print('ESA', end='\t', file=f)
+            process_esa(data.esa, data.apnoes, data.eeg, f)
+            ok(f'ESA processing finished')
 
 
 if __name__ == '__main__':
