@@ -46,6 +46,8 @@ APNOE_DURATION = APNOE_LEFT_DURATION + APNOE_RIGHT_DURATION
 # Number of points in neuron frequency curve.
 CURVE_SIZE = int(round((APNOE_DURATION - SLIDING_WINDOW_DURATION) /
                        SLIDING_WINDOW_SHIFT))
+# Determine the length of apnoe as a distance between min and max frequency.
+USE_ADAPTIVE_APNOE_DURATION = False
 ################################################################################
 # File names #
 ################################################################################
@@ -361,9 +363,13 @@ def calc_freq(neuron: np.ndarray, start: float, end: float) -> np.ndarray:
 
 
 def find_min_max(data: np.ndarray) -> CurveStats:
-    min_pos = int(np.argmin(data))
+    if len(data) == 0:
+        return CurveStats(0, 0, 0, 0)
+    # assert 'int' in str(data.dtype)
     max_pos = int(np.argmax(data))
-    return CurveStats(data[min_pos], data[max_pos], min_pos, max_pos)
+    min_poses = np.where(data == data.min(initial=data[max_pos]))[0]
+    best_min_pos = min_poses[int(np.argmin(np.abs(min_poses - max_pos)))]
+    return CurveStats(data[best_min_pos], data[max_pos], best_min_pos, max_pos)
 
 
 def process_neuron(neuron: np.ndarray, apnoes: np.ndarray, eeg: Curve,
@@ -399,8 +405,10 @@ def process_neuron(neuron: np.ndarray, apnoes: np.ndarray, eeg: Curve,
         apnoe_stats = find_min_max(activity)
         info(f'Time of minimum: {apnoe_stats.min_time - APNOE_LEFT_DURATION}')
         info(f'Time of maximum: {apnoe_stats.max_time - APNOE_LEFT_DURATION}')
-        # apnoe_duration = abs(apnoe_stats.min_time - apnoe_stats.max_time)
-        apnoe_duration = APNOE_LEFT_DURATION + APNOE_RIGHT_DURATION
+        if USE_ADAPTIVE_APNOE_DURATION:
+            apnoe_duration = abs(apnoe_stats.min_time - apnoe_stats.max_time)
+        else:
+            apnoe_duration = APNOE_LEFT_DURATION + APNOE_RIGHT_DURATION
         bootstrapped_sample = generate_sample(apnoe_duration,
                                               float(sleep.max(initial=.0)))
 
@@ -490,8 +498,10 @@ def process_esa(esa: Curve, apnoes: np.ndarray, eeg: Curve, result_file):
         apnoe_stats = find_min_max(apnoe_esa)
         info(f'Time of minimum: {apnoe_stats.min_time - APNOE_LEFT_DURATION}')
         info(f'Time of maximum: {apnoe_stats.max_time - APNOE_LEFT_DURATION}')
-        # apnoe_duration = abs(apnoe_stats.min_time - apnoe_stats.max_time)
-        apnoe_duration = APNOE_LEFT_DURATION + APNOE_RIGHT_DURATION
+        if USE_ADAPTIVE_APNOE_DURATION:
+            apnoe_duration = abs(apnoe_stats.min_time - apnoe_stats.max_time)
+        else:
+            apnoe_duration = APNOE_LEFT_DURATION + APNOE_RIGHT_DURATION
         bootstrapped_sample = generate_sample(
             apnoe_duration, float(sleep.end_time(ESA_FREQ)),
             min_time=sleep.start_time
