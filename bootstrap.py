@@ -9,6 +9,7 @@ from pathlib import Path
 from scipy.integrate import simps
 from tqdm import tqdm
 import typing as tp
+from scipy.interpolate import interp1d
 import scipy.stats as sps
 import sys
 
@@ -317,6 +318,7 @@ def extract_sleep(neuron: np.ndarray, eeg: Curve) -> np.ndarray:
 ################################################################################
 # Bootstrap
 ################################################################################
+# TODO: Remove apnoe_duration.
 def generate_sample(apnoe_duration: float, max_time: float,
                     min_time: float = 0.) -> np.ndarray:
     info('Bootstrapping sample...')
@@ -382,10 +384,23 @@ def process_neuron(neuron: np.ndarray, apnoes: np.ndarray, eeg: Curve,
         plt.savefig(str((IMAGES / f'{neuron_name}_apnoe_{i}.png')))
         plt.clf()
 
+        x_old = np.linspace(-APNOE_LEFT_DURATION, APNOE_RIGHT_DURATION,
+                            len(activity))
+        x_new = np.linspace(-APNOE_LEFT_DURATION, APNOE_RIGHT_DURATION,
+                            num=len(x_old) * 3)
+        krn = sps.gaussian_kde(activity)
+        plt.plot(x_new, krn(x_new))
+        plt.xlabel('time')
+        plt.ylabel('Neuron activity')
+        plt.title(f'Apnoe at {apnoes[i]}')
+        plt.savefig(str((IMAGES / f'{neuron_name}_apnoe_{i}_int.png')))
+        plt.clf()
+
         apnoe_stats = find_min_max(activity)
         info(f'Time of minimum: {apnoe_stats.min_time - APNOE_LEFT_DURATION}')
         info(f'Time of maximum: {apnoe_stats.max_time - APNOE_LEFT_DURATION}')
-        apnoe_duration = abs(apnoe_stats.min_time - apnoe_stats.max_time)
+        # apnoe_duration = abs(apnoe_stats.min_time - apnoe_stats.max_time)
+        apnoe_duration = APNOE_LEFT_DURATION + APNOE_RIGHT_DURATION
         bootstrapped_sample = generate_sample(apnoe_duration,
                                               float(sleep.max(initial=.0)))
 
@@ -475,7 +490,8 @@ def process_esa(esa: Curve, apnoes: np.ndarray, eeg: Curve, result_file):
         apnoe_stats = find_min_max(apnoe_esa)
         info(f'Time of minimum: {apnoe_stats.min_time - APNOE_LEFT_DURATION}')
         info(f'Time of maximum: {apnoe_stats.max_time - APNOE_LEFT_DURATION}')
-        apnoe_duration = abs(apnoe_stats.min_time - apnoe_stats.max_time)
+        # apnoe_duration = abs(apnoe_stats.min_time - apnoe_stats.max_time)
+        apnoe_duration = APNOE_LEFT_DURATION + APNOE_RIGHT_DURATION
         bootstrapped_sample = generate_sample(
             apnoe_duration, float(sleep.end_time(ESA_FREQ)),
             min_time=sleep.start_time
