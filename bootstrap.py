@@ -291,12 +291,17 @@ def extract_sleep(neuron: np.ndarray, eeg: Curve) -> np.ndarray:
     if not USE_EEG_SLEEP_DETECTION:
         return neuron
 
-    info('Extracting sleep...');
+    info('Extracting sleep...')
+
+    values = eeg.values
+    chunk_len = int(EEG_FREQ * DELTA_INTERVAL)
+    if len(values) % chunk_len != 0:
+        values = values[:-(len(values) % chunk_len)]
 
     specter = np.array([
-        band_power(eeg.values[i: i + int(EEG_FREQ * DELTA_INTERVAL)], EEG_FREQ,
+        band_power(values[i:i + chunk_len], EEG_FREQ,
                    [1, 4])
-        for i in range(0, len(eeg.values), int(EEG_FREQ * DELTA_INTERVAL))
+        for i in range(0, len(values), chunk_len)
     ])
     good_delta_intervals = np.where(
         specter.max(initial=0) * EEG_SLEEP_THRESHOLD <= specter)[0]
@@ -457,13 +462,18 @@ def extract_sleep_esa(esa: Curve, eeg: tp.Optional[Curve]) -> Curve:
     assert eeg is not None
 
     info('Extracting sleep...')
-    result = Curve(start_time=eeg.start_time, values=np.array([],
-                                                              dtype='float'))
+    result = Curve(start_time=eeg.start_time,
+                   values=np.array([], dtype='float'))
+
+    values = eeg.values
+    chunk_len = int(EEG_FREQ * DELTA_INTERVAL)
+    if len(values) % chunk_len != 0:
+        values = values[:-(len(values) % chunk_len)]
 
     specter = np.array([
-        band_power(eeg.values[i: i + int(EEG_FREQ * DELTA_INTERVAL)], EEG_FREQ,
+        band_power(values[i:i + chunk_len], EEG_FREQ,
                    [1, 4])
-        for i in range(0, len(eeg.values), int(EEG_FREQ * DELTA_INTERVAL))
+        for i in range(0, len(values), chunk_len)
     ])
     good_delta_intervals = np.where(
         specter.max(initial=0) * EEG_SLEEP_THRESHOLD <= specter)[0]
