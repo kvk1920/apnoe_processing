@@ -9,7 +9,6 @@ from pathlib import Path
 from scipy.integrate import simps
 from tqdm import tqdm
 import typing as tp
-from scipy.interpolate import interp1d
 import scipy.stats as sps
 import sys
 
@@ -48,6 +47,10 @@ CURVE_SIZE = int(round((APNOE_DURATION - SLIDING_WINDOW_DURATION) /
                        SLIDING_WINDOW_SHIFT))
 # Determine the length of apnoe as a distance between min and max frequency.
 USE_ADAPTIVE_APNOE_DURATION = False
+# Generate bootstrap visual examples.
+GENERATE_BOOTSTRAP_VISUAL_EXAMPLES = True
+# If you just wont to generate visual examples.
+DONT_CALCULATE_PVALUES = False
 ################################################################################
 # File names #
 ################################################################################
@@ -69,6 +72,11 @@ EEG_SLEEP_THRESHOLD = .6
 # ESA processing #
 ################################################################################
 ESA_FREQ: int = 1000
+################################################################################
+# Visual examples #
+################################################################################
+BACKGROUND_ALPHA: float = .2  # Transparency of bootstrap graphs.
+BACKGROUND_COUNT = 10  # Size of boostrap sample.
 ################################################################################
 
 
@@ -209,7 +217,6 @@ def load_everything() -> Data:
 
     def load_file(path: Path, *, required: bool,
                   skip_rows: int = 5) -> tp.Optional[np.ndarray]:
-        content = None
         with contextlib.suppress(Exception):
             content = np.loadtxt(str(path), skiprows=skip_rows, dtype='float')
         if content is not None and len(content.shape) == 0:
@@ -327,12 +334,12 @@ def extract_sleep(neuron: np.ndarray, eeg: Curve) -> np.ndarray:
 ################################################################################
 # TODO: Remove apnoe_duration.
 def generate_sample(apnoe_duration: float, max_time: float,
-                    min_time: float = 0.) -> np.ndarray:
+                    min_time: float = 0., size=BOOTSTRAP_SIZE) -> np.ndarray:
     info('Bootstrapping sample...')
     info(f'Apnoe duration: {apnoe_duration}')
     info(f'Max time: {max_time}')
     sample = sps.uniform(min_time, max_time - apnoe_duration).rvs(
-        size=BOOTSTRAP_SIZE)
+        size=size)
     ok('Sample ready')
     return sample
 
@@ -377,6 +384,15 @@ def find_min_max(data: np.ndarray) -> CurveStats:
     return CurveStats(data[best_min_pos], data[max_pos], best_min_pos, max_pos)
 
 
+def calculate_smoothed_activity(x: np.ndarray, x_smoothed: np.ndarray,
+                                activity: np.ndarray) -> np.ndarray:
+    assert len(x) == len(activity)
+    smoothed = np.zeros(len(x_smoothed))
+    for t in range(len(x)):
+        smoothed += sps.norm(x[t], .05).pdf(x_smoothed) * activity[t] / 80
+    return smoothed
+
+
 def process_neuron(neuron: np.ndarray, apnoes: np.ndarray, eeg: Curve,
                    result_file, neuron_name: str):
     activity_in_apnoes = [calc_freq(neuron, apnoe - APNOE_LEFT_DURATION,
@@ -387,6 +403,7 @@ def process_neuron(neuron: np.ndarray, apnoes: np.ndarray, eeg: Curve,
     for i, activity in enumerate(activity_in_apnoes):
         info(f'Processing apnoe {i}...')
 
+        # Draw neuron activity near apnoe.
         plt.plot(np.linspace(-APNOE_LEFT_DURATION, APNOE_RIGHT_DURATION,
                              len(activity)), activity)
         plt.xlabel('time')
@@ -395,12 +412,13 @@ def process_neuron(neuron: np.ndarray, apnoes: np.ndarray, eeg: Curve,
         plt.savefig(str((IMAGES / f'{neuron_name}_apnoe_{i}.png')))
         plt.clf()
 
+        # Smooth neuron activity.
         x_old = np.linspace(-APNOE_LEFT_DURATION, APNOE_RIGHT_DURATION,
                             len(activity))
         x_new = np.linspace(-APNOE_LEFT_DURATION, APNOE_RIGHT_DURATION,
                             num=len(x_old) * 3)
-        krn = sps.gaussian_kde(activity)
-        plt.plot(x_new, krn(x_new))
+        smoothed_activity = calculate_smoothed_activity(x_old, x_new, activity)
+        plt.plot(x_new, smoothed_activity)
         plt.xlabel('time')
         plt.ylabel('Neuron activity')
         plt.title(f'Apnoe at {apnoes[i]}')
@@ -553,9 +571,79 @@ def process_esa(esa: Curve, apnoes: np.ndarray, eeg: Curve, result_file):
 
 
 ################################################################################
-def main():
+# Visual example of bootstrapping.
+################################################################################
+def make_example_image(file_name: str, apnoe_activity: np.ndarray,
+                       bootstrapped_activity: tp.List[np.ndarray], *,
+                       with_smoothing: bool) -> None:
+    n = len(apnoe_activity)
+    t = np.linspace(-APNOE_LEFT_DURATION, APNOE_RIGHT_DURATION, n)
+    new_t = t
+    if with_smoothing:
+        new_t = np.linspace(-APNOE_LEFT_DURATION, APNOE_RIGHT_DURATION, 3 * n)
+
+    for activity in bootstrapped_activity:
+        assert len(activity) == n
+        if with_smoothing:
+            activity = calculate_smoothed_activity(t, new_t, activity)
+        plt.plot(new_t, activity, alpha=BACKGROUND_ALPHA, color='black')
+    if with_smoothing:
+        apnoe_activity = calculate_smoothed_activity(t, new_t, apnoe_activity)
+    plt.plot(new_t, apnoe_activity, color='red', label='real activity')
+    plt.legend()
+    plt.title('Bootstrap example')
+    plt.xlabel('Time')
+    plt.ylabel('Neuron activity')
+    plt.savefig(str((IMAGES / file_name)))
+    plt.clf()
+
+
+def visualize_bootstrap(neuron: np.ndarray, apnoes: np.ndarray, eeg: Curve,
+                        neuron_name: str) -> None:
+    sleep = extract_sleep(neuron, eeg)
+
+    for i, apnoe in enumerate(apnoes):
+        info(f'Processing apnoe {i}...')
+        bootstrapped_sample = generate_sample(APNOE_DURATION,
+                                              float(sleep.max(initial=.0)),
+                                              size=BACKGROUND_COUNT)
+        activity_near_apnoe = calc_freq(neuron, apnoe - APNOE_LEFT_DURATION,
+                                        apnoe + APNOE_RIGHT_DURATION)[:-1]
+        n = len(activity_near_apnoe)
+        bootstrapped_activity = [
+            calc_freq(neuron, begin, begin + APNOE_DURATION)[:n]
+            for begin in bootstrapped_sample
+        ]
+
+        make_example_image(f'{neuron_name}_apnoe_{i}_example.png',
+                           activity_near_apnoe,
+                           bootstrapped_activity, with_smoothing=False)
+        make_example_image(f'{neuron_name}_apnoe_{i}_example_smoothed.png',
+                           activity_near_apnoe,
+                           bootstrapped_activity, with_smoothing=True)
+
+
+def generate_visual_examples(data: Data) -> None:
+    info('Generating visual examples...')
+    for neuron_name, neuron in data.neurons.items():
+        info(f'Processing {neuron_name}...')
+        visualize_bootstrap(neuron, data.apnoes, data.eeg, neuron_name)
+
+
+################################################################################
+def main() -> None:
     IMAGES.mkdir(exist_ok=True)
     data = load_everything()
+
+    if GENERATE_BOOTSTRAP_VISUAL_EXAMPLES:
+        np.random.seed(42)
+        generate_visual_examples(data)
+
+    if DONT_CALCULATE_PVALUES:
+        info('DONT_CALCULATE_PVALUES = True, exiting...')
+        return
+
+    np.random.seed(42)
     with open(f'result.txt', 'w') as f:
         for neuron_name, neuron in data.neurons.items():
             info(f'Processing {neuron_name}...')
@@ -570,5 +658,4 @@ def main():
 
 
 if __name__ == '__main__':
-    np.random.seed(42)
     main()
