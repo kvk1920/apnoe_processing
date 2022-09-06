@@ -51,6 +51,7 @@ USE_ADAPTIVE_APNOE_DURATION = False
 GENERATE_BOOTSTRAP_VISUAL_EXAMPLES = True
 # If you just wont to generate visual examples.
 DONT_CALCULATE_PVALUES = False
+DONT_SHOW_UNSMOOTHED_PLOTS = True
 ################################################################################
 # File names #
 ################################################################################
@@ -403,14 +404,18 @@ def process_neuron(neuron: np.ndarray, apnoes: np.ndarray, eeg: Curve,
     for i, activity in enumerate(activity_in_apnoes):
         info(f'Processing apnoe {i}...')
 
-        # Draw neuron activity near apnoe.
-        plt.plot(np.linspace(-APNOE_LEFT_DURATION, APNOE_RIGHT_DURATION,
-                             len(activity)), activity)
-        plt.xlabel('time')
-        plt.ylabel('Neuron activity')
-        plt.title(f'Apnoe at {apnoes[i]}')
-        plt.savefig(str((IMAGES / f'{neuron_name}_apnoe_{i}.png')))
-        plt.clf()
+        smoothed_name = f'{neuron_name}_apnoe_{i}.png'
+
+        if not DONT_SHOW_UNSMOOTHED_PLOTS:
+            smoothed_name = f'{neuron_name}_apnoe_{i}_smoothed.png'
+            # Draw neuron activity near apnoe.
+            plt.plot(np.linspace(-APNOE_LEFT_DURATION, APNOE_RIGHT_DURATION,
+                                 len(activity)), activity)
+            plt.xlabel('time')
+            plt.ylabel('Neuron activity')
+            plt.title(f'Apnoe at {apnoes[i]}')
+            plt.savefig(str((IMAGES / f'{neuron_name}_apnoe_{i}.png')))
+            plt.clf()
 
         # Smooth neuron activity.
         x_old = np.linspace(-APNOE_LEFT_DURATION, APNOE_RIGHT_DURATION,
@@ -422,7 +427,7 @@ def process_neuron(neuron: np.ndarray, apnoes: np.ndarray, eeg: Curve,
         plt.xlabel('time')
         plt.ylabel('Neuron activity')
         plt.title(f'Apnoe at {apnoes[i]}')
-        plt.savefig(str((IMAGES / f'{neuron_name}_apnoe_{i}_int.png')))
+        plt.savefig(str((IMAGES / smoothed_name)))
         plt.clf()
 
         apnoe_stats = find_min_max(activity)
@@ -614,12 +619,15 @@ def visualize_bootstrap(neuron: np.ndarray, apnoes: np.ndarray, eeg: Curve,
             calc_freq(neuron, begin, begin + APNOE_DURATION)[:n]
             for begin in bootstrapped_sample
         ]
+        
+        smoothed_name = f'{neuron_name}_apnoe_{i}_example.png'
+        if not DONT_SHOW_UNSMOOTHED_PLOTS:
+            smoothed_name = f'{neuron_name}_apnoe_{i}_example_smoothed.png'
+            make_example_image(f'{neuron_name}_apnoe_{i}_example.png',
+                               activity_near_apnoe,
+                               bootstrapped_activity, with_smoothing=False)
 
-        make_example_image(f'{neuron_name}_apnoe_{i}_example.png',
-                           activity_near_apnoe,
-                           bootstrapped_activity, with_smoothing=False)
-        make_example_image(f'{neuron_name}_apnoe_{i}_example_smoothed.png',
-                           activity_near_apnoe,
+        make_example_image(smoothed_name, activity_near_apnoe,
                            bootstrapped_activity, with_smoothing=True)
 
 
