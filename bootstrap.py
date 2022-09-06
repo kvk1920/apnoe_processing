@@ -39,7 +39,7 @@ BOOTSTRAP_MIN_CLOSENESS: float = 1.0
 # Bootstrap sample size.
 BOOTSTRAP_SIZE: int = 1000
 # Neediness of plot of found min/max frequency.
-MINMAX_PLOT_IS_NEEDED = False
+SHOW_MINMAX_NEAR_APNOE = False
 # Total apnoe duration.
 APNOE_DURATION = APNOE_LEFT_DURATION + APNOE_RIGHT_DURATION
 # Number of points in neuron frequency curve.
@@ -49,7 +49,7 @@ CURVE_SIZE = int(round((APNOE_DURATION - SLIDING_WINDOW_DURATION) /
 USE_ADAPTIVE_APNOE_DURATION = False
 # Generate bootstrap visual examples.
 GENERATE_BOOTSTRAP_VISUAL_EXAMPLES = True
-# If you just wont to generate visual examples.
+# If you just won't generate visual examples.
 DONT_CALCULATE_PVALUES = False
 DONT_SHOW_UNSMOOTHED_PLOTS = True
 ################################################################################
@@ -357,6 +357,7 @@ class CurveStats:
 
     @property
     def min_time(self) -> float:
+        # NB: It's time in seconds from apnoe start.
         return self.min_pos * SLIDING_WINDOW_SHIFT
 
     @property
@@ -390,7 +391,11 @@ def calculate_smoothed_activity(x: np.ndarray, x_smoothed: np.ndarray,
     assert len(x) == len(activity)
     smoothed = np.zeros(len(x_smoothed))
     for t in range(len(x)):
-        smoothed += sps.norm(x[t], .05).pdf(x_smoothed) * activity[t] / 80
+        smoothed += sps.norm(x[t], .05).pdf(x_smoothed) * activity[t]
+    # Scaling.
+    smoothed -= smoothed.min()
+    smoothed *= (activity.max() - activity.min()) / smoothed.max()
+    smoothed += activity.min()
     return smoothed
 
 
@@ -404,16 +409,32 @@ def process_neuron(neuron: np.ndarray, apnoes: np.ndarray, eeg: Curve,
     for i, activity in enumerate(activity_in_apnoes):
         info(f'Processing apnoe {i}...')
 
+        apnoe_stats = find_min_max(activity)
+        info(f'Time of minimum: {apnoe_stats.min_time - APNOE_LEFT_DURATION}')
+        info(f'Time of maximum: {apnoe_stats.max_time - APNOE_LEFT_DURATION}')
+
         smoothed_name = f'{neuron_name}_apnoe_{i}.png'
+
+        def maybe_show_min_max(p):
+            if not SHOW_MINMAX_NEAR_APNOE:
+                return
+            p.axvline(-APNOE_LEFT_DURATION + apnoe_stats.min_time +
+                      SLIDING_WINDOW_DURATION, c='b', label='min', ls='--')
+            p.axhline(apnoe_stats.min_value, c='b', ls='--')
+            p.axvline(-APNOE_LEFT_DURATION + apnoe_stats.max_time +
+                      SLIDING_WINDOW_DURATION, c='g', label='max', ls='--')
+            p.axhline(apnoe_stats.max_value, c='g', ls='--')
 
         if not DONT_SHOW_UNSMOOTHED_PLOTS:
             smoothed_name = f'{neuron_name}_apnoe_{i}_smoothed.png'
             # Draw neuron activity near apnoe.
             plt.plot(np.linspace(-APNOE_LEFT_DURATION, APNOE_RIGHT_DURATION,
-                                 len(activity)), activity)
-            plt.xlabel('time')
-            plt.ylabel('Neuron activity')
+                                 len(activity)), activity, c='k')
+            maybe_show_min_max(plt)
+            plt.xlabel('Time, seconds')
+            plt.ylabel('Neuron activity, Hz')
             plt.title(f'Apnoe at {apnoes[i]}')
+            plt.legend()
             plt.savefig(str((IMAGES / f'{neuron_name}_apnoe_{i}.png')))
             plt.clf()
 
@@ -424,15 +445,14 @@ def process_neuron(neuron: np.ndarray, apnoes: np.ndarray, eeg: Curve,
                             num=len(x_old) * 3)
         smoothed_activity = calculate_smoothed_activity(x_old, x_new, activity)
         plt.plot(x_new, smoothed_activity)
-        plt.xlabel('time')
-        plt.ylabel('Neuron activity')
+        maybe_show_min_max(plt)
+        plt.xlabel('Time, seconds')
+        plt.ylabel('Neuron activity, Hz')
         plt.title(f'Apnoe at {apnoes[i]}')
+        plt.legend()
         plt.savefig(str((IMAGES / smoothed_name)))
         plt.clf()
 
-        apnoe_stats = find_min_max(activity)
-        info(f'Time of minimum: {apnoe_stats.min_time - APNOE_LEFT_DURATION}')
-        info(f'Time of maximum: {apnoe_stats.max_time - APNOE_LEFT_DURATION}')
         if USE_ADAPTIVE_APNOE_DURATION:
             apnoe_duration = abs(apnoe_stats.min_time - apnoe_stats.max_time)
         else:
