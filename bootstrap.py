@@ -388,6 +388,7 @@ def find_min_max(data: np.ndarray) -> CurveStats:
 
 def calculate_smoothed_activity(x: np.ndarray, x_smoothed: np.ndarray,
                                 activity: np.ndarray) -> np.ndarray:
+    # TODO: https://scipy-cookbook.readthedocs.io/items/SignalSmooth.html
     assert len(x) == len(activity)
     smoothed = np.zeros(len(x_smoothed))
     for t in range(len(x)):
