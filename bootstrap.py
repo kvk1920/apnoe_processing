@@ -50,8 +50,8 @@ USE_ADAPTIVE_APNOE_DURATION = False
 # Generate bootstrap visual examples.
 GENERATE_BOOTSTRAP_VISUAL_EXAMPLES = True
 # If you just won't generate visual examples.
-DONT_CALCULATE_PVALUES = False
-DONT_SHOW_UNSMOOTHED_PLOTS = True
+DONT_CALCULATE_PVALUES = True
+DONT_SHOW_UNSMOOTHED_PLOTS = False
 ################################################################################
 # File names #
 ################################################################################
@@ -76,8 +76,9 @@ ESA_FREQ: int = 1000
 ################################################################################
 # Visual examples #
 ################################################################################
-BACKGROUND_ALPHA: float = .2  # Transparency of bootstrap graphs.
-BACKGROUND_COUNT = 10  # Size of boostrap sample.
+BACKGROUND_ALPHA: float = 0.6  # Transparency of bootstrap graphs.
+BACKGROUND_COUNT: int = 10  # Size of boostrap sample.
+BACKGROUND_WIDTH: float = 1.0
 ################################################################################
 
 
@@ -608,11 +609,14 @@ def make_example_image(file_name: str, apnoe_activity: np.ndarray,
     if with_smoothing:
         new_t = np.linspace(-APNOE_LEFT_DURATION, APNOE_RIGHT_DURATION, 3 * n)
 
+    mean_activity = np.zeros(n)
     for activity in bootstrapped_activity:
-        assert len(activity) == n
-        if with_smoothing:
-            activity = calculate_smoothed_activity(t, new_t, activity)
-        plt.plot(new_t, activity, alpha=BACKGROUND_ALPHA, color='black')
+        mean_activity += activity
+    mean_activity /= len(bootstrapped_activity)
+    if with_smoothing:
+        mean_activity = calculate_smoothed_activity(t, new_t, mean_activity)
+    plt.plot(new_t, mean_activity, alpha=BACKGROUND_ALPHA, color='black',
+             lw=BACKGROUND_WIDTH)
     if with_smoothing:
         apnoe_activity = calculate_smoothed_activity(t, new_t, apnoe_activity)
     plt.plot(new_t, apnoe_activity, color='red', label='real activity')
